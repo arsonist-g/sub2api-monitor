@@ -1,0 +1,151 @@
+name: Build and Push sub2api latest
+
+# 每 30 分钟检查上游 Wei-Shaw/sub2api main 分支：
+#   - 无新 commit -> 跳过构建（check job 直接结束，几乎不消耗 Actions 时间）
+#   - 有新 commit -> amd64/arm64 原生 runner 各自构建（上游 Dockerfile 为
+#     BUILDPLATFORM 交叉编译，无需 QEMU），合并为多架构 latest 推送 GHCR，
+#     成功后回写 upstream-sha；失败不回写，下个周期自动重试。
+# 复用 easy_proxies 的「矩阵构建 + manifest 合并」模式，仅发 latest。
+
+on:
+  push:
+    branches: [ main ]
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write   # 构建成功后回写 upstream-sha
+  packages: write   # 推送 GHCR
+
+concurrency:
+  group: docker-build
+  cancel-in-progress: false   # 排队不取消，避免两个构建互相覆盖 latest
+
+env:
+  UPSTREAM_REPO: Wei-Shaw/sub2api
+  UPSTREAM_BRANCH: main
+  IMAGE: ghcr.io/arsonist-g/sub2api
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      sha: ${{ steps.check.outputs.sha }}
+      short: ${{ steps.check.outputs.short }}
+      changed: ${{ steps.check.outputs.changed }}
+    steps:
+      - name: Checkout monitor repo
+        uses: actions/checkout@v4
+
+      - name: Check upstream for new commits
+        id: check
+        run: |
+          SHA=$(git ls-remote "https://github.com/${UPSTREAM_REPO}.git" "refs/heads/${UPSTREAM_BRANCH}" | cut -f1)
+          if [ -z "$SHA" ]; then
+            echo "ls-remote returned empty, aborting"; exit 1
+          fi
+          LAST=$(cat upstream-sha 2>/dev/null || true)
+          echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
+          echo "short=${SHA:0:7}" >> "$GITHUB_OUTPUT"
+          if [ "$SHA" = "$LAST" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Upstream unchanged at ${SHA:0:7}, skip build"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "Upstream ${UPSTREAM_BRANCH} moved to ${SHA:0:7} (last built: ${LAST:-none}), build"
+          fi
+
+  build:
+    needs: check
+    if: needs.check.outputs.changed == 'true'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+            arch: amd64
+          - platform: linux/arm64
+            runner: ubuntu-22.04-arm
+            arch: arm64
+    steps:
+      - name: Checkout upstream sub2api
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ needs.check.outputs.sha }}
+          path: sub2api
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ github.token }}
+
+      # 用固定的 latest-<arch> 作为中转 tag，随构建覆盖，不会随时间累积
+      - name: Build and push (${{ matrix.arch }})
+        uses: docker/build-push-action@v6
+        with:
+          context: sub2api
+          platforms: ${{ matrix.platform }}
+          cache-from: type=gha,scope=build-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=build-${{ matrix.arch }}
+          push: true
+          provenance: false
+          tags: ${{ env.IMAGE }}:latest-${{ matrix.arch }}
+          build-args: |
+            COMMIT=${{ needs.check.outputs.short }}
+            GOPROXY=https://proxy.golang.org,direct
+            GOSUMDB=sum.golang.org
+          labels: |
+            org.opencontainers.image.title=sub2api
+            org.opencontainers.image.source=https://github.com/${{ env.UPSTREAM_REPO }}
+            org.opencontainers.image.revision=${{ needs.check.outputs.sha }}
+            org.opencontainers.image.description=Automated build of upstream sub2api main
+
+  manifest:
+    needs: [check, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ github.token }}
+
+      - name: Create and push multi-arch latest
+        run: |
+          echo "Creating multi-arch manifest for ${IMAGE}:latest"
+          docker manifest create "${IMAGE}:latest" \
+            "${IMAGE}:latest-amd64" \
+            "${IMAGE}:latest-arm64"
+          docker manifest push "${IMAGE}:latest"
+
+  record:
+    needs: [check, manifest]
+    if: needs.check.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout monitor repo
+        uses: actions/checkout@v4
+
+      # 仅在构建+推送成功后回写，失败则下个周期重试同一 commit
+      - name: Record built sha
+        run: |
+          echo "${{ needs.check.outputs.sha }}" > upstream-sha
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add upstream-sha
+          git commit -m "build: upstream ${UPSTREAM_REPO}@${{ needs.check.outputs.short }}"
+          git push
