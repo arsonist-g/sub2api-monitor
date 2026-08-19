@@ -57,6 +57,20 @@ jobs:
             echo "Upstream ${UPSTREAM_BRANCH} moved to ${SHA:0:7} (last built: ${LAST:-none}), build"
           fi
 
+  # GHCR 新包默认 private，需设为 public 才能匿名拉取。幂等，每次运行都执行；
+  # 包尚不存在时 404，属预期，不阻塞
+  visibility:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Ensure GHCR package is public
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api --method PATCH "user/packages/container/${IMAGE##*/}" -f visibility=public
+          echo "package ${IMAGE} is public"
+
   build:
     needs: check
     if: needs.check.outputs.changed == 'true'
