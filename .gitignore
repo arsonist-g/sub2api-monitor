@@ -4,3 +4,6 @@ project-memory/
 
 # 本地杂项
 *.bak
+
+# research-assistant 临时抓取产物
+tmp-doc/
